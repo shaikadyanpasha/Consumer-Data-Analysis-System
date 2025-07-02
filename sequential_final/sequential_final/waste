@@ -1,0 +1,702 @@
+#define NOMINMAX
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <map>
+#include <set>
+#include <sstream>
+#include <algorithm>
+#include <windows.h>
+#include <sqlite3.h>
+#include <regex>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <sstream>
+
+using namespace std;
+
+// Lock program to 1 CPU core (sequential behavior)
+void lock_to_one_cpu() {
+    HANDLE process = GetCurrentProcess();
+    DWORD_PTR mask = 1;
+    SetProcessAffinityMask(process, mask);
+    cout << "⚙️  Running on a single core..." << endl;
+}
+
+// Struct to hold raw database rows
+struct RawSteamRow {
+    std::string url;
+    std::string types;
+    std::string name;
+    std::string desc_snippet;
+    std::string recent_reviews;
+    std::string all_reviews;
+    std::string release_date;
+    std::string developer;
+    std::string publisher;
+    std::string popular_tags;
+    std::string game_details;
+    std::string languages;
+    std::string achievements;
+    std::string genre;
+    std::string game_description;
+    std::string mature_content;
+    std::string minimum_requirements;
+    std::string recommended_requirements;
+    std::string original_price;
+    std::string discount_price;
+};
+
+
+// Part 2: SQLite Connection + Raw Row Loader
+
+// Global database connection
+sqlite3* db;
+
+// Vector to hold all imported rows
+vector<RawSteamRow> rawRows;
+
+// Safe string reader to prevent null crashes
+string get_text(sqlite3_stmt* stmt, int col) {
+    const unsigned char* val = sqlite3_column_text(stmt, col);
+    return val ? reinterpret_cast<const char*>(val) : "";
+}
+
+// Function to load all rows from the 'steam_games' table
+bool load_raw_rows() {
+    string query = "SELECT * FROM steam_games;";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        cerr << "❌ Failed to prepare SELECT: " << sqlite3_errmsg(db) << endl;
+        return false;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        RawSteamRow row;
+        row.url                      = get_text(stmt, 0);
+        row.types                    = get_text(stmt, 1);
+        row.name                     = get_text(stmt, 2);
+        row.desc_snippet             = get_text(stmt, 3);
+        row.recent_reviews           = get_text(stmt, 4);
+        row.all_reviews              = get_text(stmt, 5);
+        row.release_date             = get_text(stmt, 6);
+        row.developer                = get_text(stmt, 7);
+        row.publisher                = get_text(stmt, 8);
+        row.popular_tags             = get_text(stmt, 9);
+        row.game_details             = get_text(stmt, 10);
+        row.languages                = get_text(stmt, 11);
+        row.achievements             = get_text(stmt, 12);
+        row.genre                    = get_text(stmt, 13);
+        row.game_description         = get_text(stmt, 14);
+        row.mature_content           = get_text(stmt, 15);
+        row.minimum_requirements     = get_text(stmt, 16);
+        row.recommended_requirements = get_text(stmt, 17);
+        row.original_price           = get_text(stmt, 18);
+        row.discount_price           = get_text(stmt, 19);
+
+        rawRows.push_back(row);
+    }
+
+    sqlite3_finalize(stmt);
+    cout << "✅ Loaded " << rawRows.size() << " rows from the database.\n";
+    return true;
+}
+
+// Debugging export to verify raw data
+void export_raw_debug() {
+    ofstream file("debug_raw_rows.csv");
+    file << "url,types,name,desc_snippet,recent_reviews,all_reviews,release_date,developer,publisher,"
+         << "popular_tags,game_details,languages,achievements,genre,game_description,mature_content,"
+         << "minimum_requirements,recommended_requirements,original_price,discount_price\n";
+
+    for (const auto& row : rawRows) {
+        file << "\"" << row.url << "\","
+             << "\"" << row.types << "\","
+             << "\"" << row.name << "\","
+             << "\"" << row.desc_snippet << "\","
+             << "\"" << row.recent_reviews << "\","
+             << "\"" << row.all_reviews << "\","
+             << "\"" << row.release_date << "\","
+             << "\"" << row.developer << "\","
+             << "\"" << row.publisher << "\","
+             << "\"" << row.popular_tags << "\","
+             << "\"" << row.game_details << "\","
+             << "\"" << row.languages << "\","
+             << "\"" << row.achievements << "\","
+             << "\"" << row.genre << "\","
+             << "\"" << row.game_description << "\","
+             << "\"" << row.mature_content << "\","
+             << "\"" << row.minimum_requirements << "\","
+             << "\"" << row.recommended_requirements << "\","
+             << "\"" << row.original_price << "\","
+             << "\"" << row.discount_price << "\"\n";
+    }
+
+    file.close();
+    cout << "📁 Raw row export saved to debug_raw_rows.csv\n";
+}
+
+// ===================== Part 3: Struct Definitions & Data Formatter =====================
+struct SteamGame {
+    int app_id;
+    std::string name;
+    std::string release_date;
+    std::string developer;
+    std::string publisher;
+    float original_price;
+    float all_reviews;
+    float recent_reviews;
+    std::string language;
+    std::string overall_genre;
+    std::string min_requirements;
+    std::string rec_requirements;
+
+    // For Part 5 reuse (genre count)
+    std::string popular_tags;
+    std::string genre;
+    std::string game_details;
+};
+
+std::vector<SteamGame> structured_games;
+
+// Helper: merge genres from multiple fields
+std::string merge_genres(const std::string& tags, const std::string& details, const std::string& genre) {
+    std::set<std::string> genre_set;
+    std::stringstream ss(tags + "," + details + "," + genre);
+    std::string token;
+
+    while (std::getline(ss, token, ',')) {
+        token.erase(std::remove_if(token.begin(), token.end(), ::isspace), token.end());
+        if (!token.empty()) genre_set.insert(token);
+    }
+
+    std::string result;
+    for (const auto& g : genre_set) {
+        if (!result.empty()) result += ", ";
+        result += g;
+    }
+    return result;
+}
+// Helper: extract review percent from "(80%)"
+float extract_review_percent(const std::string& text) {
+    size_t start = text.find('(');
+    size_t end = text.find('%');
+    if (start != std::string::npos && end != std::string::npos && end > start) {
+        std::string val = text.substr(start + 1, end - start - 1);
+        try {
+            return std::stof(val);
+        } catch (...) {
+            return -1.0f;
+        }
+    }
+    return -1.0f;
+}
+
+// Format all RawSteamRow into SteamGame
+void format_all_games() {
+    structured_games.clear();
+
+    for (const auto& row : rawRows) {
+        try {
+            SteamGame game;
+            //game.app_id = row.id;
+            game.name = row.name;
+            game.release_date = row.release_date;
+            game.developer = row.developer;
+            game.publisher = row.publisher;
+            game.language = row.supported_languages;
+            game.min_requirements = row.minimum_requirements;
+            game.rec_requirements = row.recommended_requirements;
+            game.popular_tags = row.popular_tags;
+            game.genre = row.genre;
+            game.game_details = row.game_details;
+            game.overall_genre = merge_genres(row.popular_tags, row.game_details, row.genre);
+            game.all_reviews = extract_review_percent(row.all_reviews);
+            game.recent_reviews = extract_review_percent(row.recent_reviews);
+
+            std::string price_str = row.original_price;
+            std::transform(price_str.begin(), price_str.end(), price_str.begin(), ::tolower);
+            if (price_str.empty()) continue;
+
+            if (price_str.find("free") != std::string::npos) {
+                game.original_price = 0.0f;
+            } else {
+                price_str.erase(std::remove_if(price_str.begin(), price_str.end(), [](char c) {
+                    return !(isdigit(c) || c == '.' || c == '-');
+                }), price_str.end());
+                if (price_str.empty()) continue;
+                try {
+                    game.original_price = std::stof(price_str);
+                } catch (...) {
+                    continue;
+                }
+            }
+
+            structured_games.push_back(game);
+        } catch (...) {
+            continue;
+        }
+    }
+
+    std::cout << "✅ Structured " << structured_games.size() << " games successfully.\n";
+}
+
+// Debugging export for formatted games
+void export_structured_data(const std::string& filename = "formatted_debug.csv") {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "❌ Could not open export file.\n";
+        return;
+    }
+
+    file << "AppID,Name,ReleaseDate,Developer,Publisher,Price,AllReviews,RecentReviews,Language,Genre,MinReqs,RecReqs\n";
+    for (const auto& game : structured_games) {
+        file << game.app_id << "," << "\"" << game.name << "\"," << "\"" << game.release_date << "\"," << "\"" << game.developer << "\","
+             << "\"" << game.publisher << "\"," << game.original_price << "," << game.all_reviews << "," << game.recent_reviews << ","
+             << "\"" << game.language << "\"," << "\"" << game.overall_genre << "\"," << "\"" << game.min_requirements << "\","
+             << "\"" << game.rec_requirements << "\"\n";
+    }
+
+    file.close();
+    std::cout << "📁 Exported structured data to " << filename << "\n";
+}
+
+// Helper function to split a string by a delimiter and trim whitespace
+std::vector<std::string> splitAndTrim(const std::string& str, char delimiter) {
+    std::vector<std::string> result;
+    std::string token;
+    std::stringstream ss(str);
+
+    while (std::getline(ss, token, delimiter)) {
+        token.erase(token.begin(), std::find_if(token.begin(), token.end(), [](unsigned char ch) {
+            return !std::isspace(ch);
+        }));
+        token.erase(std::find_if(token.rbegin(), token.rend(), [](unsigned char ch) {
+            return !std::isspace(ch);
+        }).base(), token.end());
+
+        result.push_back(token);
+    }
+
+    return result;
+}
+// ===================== Part 4: System Requirements Analyzer =====================
+
+std::map<std::string, int> min_os_count, min_cpu_count, min_ram_count, min_gpu_count;
+std::map<std::string, int> rec_os_count, rec_cpu_count, rec_ram_count, rec_gpu_count;
+
+// Helper: parse a spec field by keyword
+void extract_spec_field(const std::string& text, const std::string& keyword, std::map<std::string, int>& counter) {
+    std::regex rgx(keyword + R"((:|\s)?([^\n\r<]*)?)", std::regex::icase);
+    std::smatch match;
+
+    std::string::const_iterator searchStart(text.cbegin());
+    while (std::regex_search(searchStart, text.cend(), match, rgx)) {
+        std::string val = match[2].str();
+        val.erase(std::remove_if(val.begin(), val.end(), ::isspace), val.end());
+        if (!val.empty()) counter[val]++;
+        searchStart = match.suffix().first;
+    }
+}
+// ✅ Debugging export: export system requirement counts to two separate CSVs
+void export_requirements_debug() {
+    std::ofstream out_min("debug_min_requirements.csv");
+    out_min << "SpecType,SpecValue,Count\n";
+    for (const auto& [k, v] : min_os_count) out_min << "Min OS," << k << "," << v << "\n";
+    for (const auto& [k, v] : min_cpu_count) out_min << "Min CPU," << k << "," << v << "\n";
+    for (const auto& [k, v] : min_ram_count) out_min << "Min RAM," << k << "," << v << "\n";
+    for (const auto& [k, v] : min_gpu_count) out_min << "Min GPU," << k << "," << v << "\n";
+    out_min.close();
+
+    std::ofstream out_rec("debug_rec_requirements.csv");
+    out_rec << "SpecType,SpecValue,Count\n";
+    for (const auto& [k, v] : rec_os_count) out_rec << "Rec OS," << k << "," << v << "\n";
+    for (const auto& [k, v] : rec_cpu_count) out_rec << "Rec CPU," << k << "," << v << "\n";
+    for (const auto& [k, v] : rec_ram_count) out_rec << "Rec RAM," << k << "," << v << "\n";
+    for (const auto& [k, v] : rec_gpu_count) out_rec << "Rec GPU," << k << "," << v << "\n";
+    out_rec.close();
+
+    std::cout << "📄 Exports:\n";
+    std::cout << "  • Minimum: debug_min_requirements.csv\n";
+    std::cout << "  • Recommended: debug_rec_requirements.csv\n";
+}
+
+void analyze_system_requirements() {
+    min_os_count.clear(); min_cpu_count.clear(); min_ram_count.clear(); min_gpu_count.clear();
+    rec_os_count.clear(); rec_cpu_count.clear(); rec_ram_count.clear(); rec_gpu_count.clear();
+
+    for (const auto& game : structured_games) {
+        extract_spec_field(game.min_requirements, "OS", min_os_count);
+        extract_spec_field(game.min_requirements, "Processor", min_cpu_count);
+        extract_spec_field(game.min_requirements, "Memory", min_ram_count);
+        extract_spec_field(game.min_requirements, "Graphics", min_gpu_count);
+
+        extract_spec_field(game.rec_requirements, "OS", rec_os_count);
+        extract_spec_field(game.rec_requirements, "Processor", rec_cpu_count);
+        extract_spec_field(game.rec_requirements, "Memory", rec_ram_count);
+        extract_spec_field(game.rec_requirements, "Graphics", rec_gpu_count);
+    }
+
+    std::cout << "🛠️  System Requirements Analyzed.\n";
+
+    export_requirements_debug();  // <== Call debug export here
+}
+
+// Helper: display top N most common entries
+void print_top_requirements(const std::map<std::string, int>& counter, const std::string& label, int topN = 5) {
+    std::vector<std::pair<std::string, int>> sorted(counter.begin(), counter.end());
+    std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
+
+    std::cout << "🔹 Top " << topN << " " << label << ":\n";
+    for (int i = 0; i < std::min((int)sorted.size(), topN); ++i) {
+        std::cout << "   " << sorted[i].first << " — " << sorted[i].second << " games\n";
+    }
+}
+
+
+// ==================== Part 5: Top 5 Game Highlights ====================
+void export_top_games_and_genres() {
+    // ===== Top 5 games by review % =====
+    std::vector<std::pair<std::string, int>> review_rank;
+    for (const auto& game : structured_games) {
+        review_rank.emplace_back(game.name, game.all_reviews);
+    }
+
+    std::sort(review_rank.begin(), review_rank.end(),
+        [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::ofstream out_games("debug_top_games.csv");
+    out_games << "Game,ReviewPercent\n";
+    for (size_t i = 0; i < std::min<size_t>(5, review_rank.size()); ++i) {
+        out_games << "\"" << review_rank[i].first << "\"," << review_rank[i].second << "\n";
+    }
+    out_games.close();
+
+    // ===== Top 5 genres by frequency =====
+    std::map<std::string, int> genre_count;
+    for (const auto& game : structured_games) {
+        std::set<std::string> genreSet;
+
+        // Helper lambda function to collect genres from different fields
+        auto collectGenres = [&](const std::string& field) {
+            std::string field_value;
+            if (field == "popular_tags") {
+                field_value = game.popular_tags;
+            } else if (field == "genre") {
+                field_value = game.genre;
+            } else if (field == "game_details") {
+                field_value = game.game_details;
+            }
+
+            // Now split and trim the genres
+            for (std::string g : splitAndTrim(field_value, ',')) {
+                if (!g.empty()) genreSet.insert(g);
+            }
+        };
+
+        // Collect genres from the respective fields
+        collectGenres("popular_tags");
+        collectGenres("genre");
+        collectGenres("game_details");
+
+        for (const auto& g : genreSet) {
+            genre_count[g]++;
+        }
+    }
+
+    // Sort genres by frequency
+    std::vector<std::pair<std::string, int>> genre_rank(genre_count.begin(), genre_count.end());
+    std::sort(genre_rank.begin(), genre_rank.end(),
+        [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    // Export the top 5 genres to a CSV file
+    std::ofstream out_genres("debug_top_genres.csv");
+    out_genres << "Genre,Frequency\n";
+    for (size_t i = 0; i < std::min<size_t>(5, genre_rank.size()); ++i) {
+        out_genres << "\"" << genre_rank[i].first << "\"," << genre_rank[i].second << "\n";
+    }
+    out_genres.close();
+
+    std::cout << "📤 Exported top games and genres to CSV.\n";
+}
+// ==================== Part 6: Developer-Level Stats ====================
+void export_developer_stats() {
+    std::map<std::string, std::vector<SteamGame>> games_by_developer;
+
+    // Group games by developer
+    for (const auto& game : structured_games) {
+        games_by_developer[game.developer].push_back(game);
+    }
+
+    // Open output CSV
+    std::ofstream out("debug_developer_stats.csv");
+    out << "Developer,AvgRecentReview,AvgAllReview,AvgPrice,MostCommonGenre,MostCommonLanguage\n";
+
+    // Process each developer's games
+    for (const auto& [developer, games] : games_by_developer) {
+        int total_recent = 0, total_all = 0, count = 0;
+        double total_price = 0.0;
+        std::map<std::string, int> genre_count;
+        std::map<std::string, int> language_count;
+
+        for (const auto& game : games) {
+            total_recent += game.recent_reviews;
+            total_all += game.all_reviews;
+            count++;
+
+            // Price: only count valid prices (>= 0)
+            if (game.original_price >= 0)
+                total_price += game.original_price;
+
+            // Genres
+            for (const std::string& g : splitAndTrim(game.overall_genre, ',')) {
+                if (!g.empty()) genre_count[g]++;
+            }
+
+            // Languages
+            for (const std::string& lang : splitAndTrim(game.language, ',')) {
+                if (!lang.empty()) language_count[lang]++;
+            }
+        }
+
+        // Determine most common genre
+        std::string common_genre = genre_count.empty() ? "N/A" :
+            std::max_element(genre_count.begin(), genre_count.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+
+        // Determine most common language
+        std::string common_lang = language_count.empty() ? "N/A" :
+            std::max_element(language_count.begin(), language_count.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+
+        // Write to CSV
+        out << "\"" << developer << "\","
+            << (count ? total_recent / count : 0) << ","
+            << (count ? total_all / count : 0) << ","
+            << (count ? total_price / count : 0.0) << ","
+            << common_genre << ","
+            << common_lang << "\n";
+    }
+
+    out.close();
+    std::cout << "📤 Exported developer stats to CSV.\n";
+}
+// ==================== Part 7: Publisher-Level Stats ====================
+void export_publisher_stats() {
+    std::map<std::string, std::vector<SteamGame>> games_by_publisher;
+
+    // Group games by publisher
+    for (const auto& game : structured_games) {
+        games_by_publisher[game.publisher].push_back(game);
+    }
+
+    // Calculate averages and common fields
+    std::ofstream out("debug_publisher_stats.csv");
+    out << "Publisher,AvgRecentReview,AvgAllReview,AvgPrice,MostCommonGenre,MostCommonLanguage\n";
+
+    for (const auto& [publisher, games] : games_by_publisher) {
+        int total_recent = 0, total_all = 0, count = 0;
+        double total_price = 0.0;
+        std::map<std::string, int> genre_count;
+        std::map<std::string, int> language_count;
+
+        for (const auto& game : games) {
+            total_recent += game.recent_reviews;
+            total_all += game.all_reviews;
+            count++;
+
+            // Price
+            if (game.original_price >= 0)
+                total_price += game.original_price;
+
+            // Genres
+            std::stringstream gss(game.overall_genre);
+            std::string genre;
+            while (std::getline(gss, genre, ',')) {
+                genre.erase(std::remove_if(genre.begin(), genre.end(), ::isspace), genre.end());
+                if (!genre.empty()) genre_count[genre]++;
+            }
+
+            // Languages
+            std::stringstream lss(game.language);
+            std::string lang;
+            while (std::getline(lss, lang, ',')) {
+                lang.erase(std::remove_if(lang.begin(), lang.end(), ::isspace), lang.end());
+                if (!lang.empty()) language_count[lang]++;
+            }
+        }
+
+        std::string common_genre = genre_count.empty() ? "N/A" :
+            std::max_element(genre_count.begin(), genre_count.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+
+        std::string common_lang = language_count.empty() ? "N/A" :
+            std::max_element(language_count.begin(), language_count.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+
+        out << "\"" << publisher << "\","
+            << (count ? total_recent / count : 0) << ","
+            << (count ? total_all / count : 0) << ","
+            << (count ? total_price / count : 0.0) << ","
+            << common_genre << ","
+            << common_lang << "\n";
+    }
+
+    out.close();
+    std::cout << "📤 Exported publisher stats to CSV.\n";
+}
+// ==================== Part 8: Benchmarking ====================
+#include <chrono>
+
+void run_benchmark() {
+    std::ofstream bench("benchmark_results.csv");
+    bench << "Step,Time(ms)\n";
+
+    auto start_total = std::chrono::high_resolution_clock::now();
+    long long total_sum = 0;
+
+    // Step 1: Raw import timing
+    auto t1 = std::chrono::high_resolution_clock::now();
+    export_raw_debug();
+    auto t2 = std::chrono::high_resolution_clock::now();
+    long long ms1 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    bench << "Raw Export," << ms1 << "\n";
+    total_sum += ms1;
+
+    // Step 2: Format data
+    t1 = std::chrono::high_resolution_clock::now();
+    format_all_games();
+    export_structured_data();
+    t2 = std::chrono::high_resolution_clock::now();
+    long long ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    bench << "Data Formatting," << ms2 << "\n";
+    total_sum += ms2;
+
+    // Step 3: Analyze requirements
+    t1 = std::chrono::high_resolution_clock::now();
+    analyze_system_requirements();
+    t2 = std::chrono::high_resolution_clock::now();
+    long long ms3 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    bench << "System Requirements," << ms3 << "\n";
+    total_sum += ms3;
+
+    // Step 4: Top games and genres
+    t1 = std::chrono::high_resolution_clock::now();
+    export_top_games_and_genres();
+    t2 = std::chrono::high_resolution_clock::now();
+    long long ms4 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    bench << "Top Games & Genres," << ms4 << "\n";
+    total_sum += ms4;
+    // Step 5: Developer stats
+    t1 = std::chrono::high_resolution_clock::now();
+    export_developer_stats();
+    t2 = std::chrono::high_resolution_clock::now();
+    long long ms5 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    bench << "Developer Stats," << ms5 << "\n";
+    total_sum += ms5;
+
+    // Step 6: Publisher stats
+    t1 = std::chrono::high_resolution_clock::now();
+    export_publisher_stats();
+    t2 = std::chrono::high_resolution_clock::now();
+    long long ms6 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    bench << "Publisher Stats," << ms6 << "\n";
+    total_sum += ms6;
+
+    // Step 7: Total summed time and wall clock
+    auto end_total = std::chrono::high_resolution_clock::now();
+    long long wall_clock = std::chrono::duration_cast<std::chrono::milliseconds>(end_total - start_total).count();
+    bench << "Summed Total Time," << total_sum << "\n";
+    bench << "Wall Clock Time," << wall_clock << "\n";
+
+    // Step 8: Throughput
+    double throughput = structured_games.empty() ? 0 : (structured_games.size() * 1000.0 / wall_clock);
+    bench << "Throughput (games/sec)," << throughput << "\n";
+
+    // Step 9: Scale simulation (est. time for 1M entries)
+    long long simulated_ms = (wall_clock * 1000000LL) / (structured_games.size() > 0 ? structured_games.size() : 1);
+    bench << "Scale Simulation (1M games, ms)," << simulated_ms << "\n";
+
+    bench.close();
+
+    std::cout << "📊 Benchmarking complete. Results saved to benchmark_results.csv\n";
+}
+// ==================== Part 9: Interactive Menu ====================
+void run_menu() {
+    while (true) {
+        std::cout << "\n📊 === Sequential Steam Analyzer Menu ===\n";
+        std::cout << "1. Top 5 games and genres\n";
+        std::cout << "2. Average stats by developer\n";
+        std::cout << "3. Average stats by publisher\n";
+        std::cout << "4. System requirements summary\n";
+        std::cout << "5. Run benchmark (Part 8)\n";
+        std::cout << "6. Debugging exports (raw + structured data)\n";
+        std::cout << "0. Exit\n";
+        std::cout << "Select an option: ";
+
+        int choice;
+        std::cin >> choice;
+
+        switch (choice) {
+            case 1:
+                export_top_games_and_genres();  // ✅ Part 5
+                break;
+            case 2:
+                export_developer_stats();       // ✅ Part 6
+                break;
+            case 3:
+                export_publisher_stats();       // ✅ Part 7
+                break;
+            case 4:
+                analyze_system_requirements();  // ✅ Part 4
+                break;
+            case 5:
+                run_benchmark();                // ✅ Part 8
+                break;
+            case 6:
+                export_raw_debug();             // ✅ Preview raw SQL data
+                export_structured_data();       // ✅ Preview formatted data
+                break;
+            case 0:
+                std::cout << "👋 Exiting...\n";
+                return;
+            default:
+                std::cout << "❌ Invalid option. Try again.\n";
+                break;
+        }
+    }
+}
+int main() {
+    lock_to_one_cpu();  // ✅ Limit to 1 CPU
+
+    // ✅ Open SQLite DB directly
+    if (sqlite3_open("steam.db", &db) != SQLITE_OK) {
+        std::cerr << "❌ Failed to open database: " << sqlite3_errmsg(db) << std::endl;
+        return 1;
+    }
+
+    std::cout << "✅ SQLite connected successfully!\n";
+
+    // ✅ Load and format data before menu
+    std::cout << "📥 Attempting to load raw rows from 'steam_games'...\n";
+    if (!load_raw_rows()) {
+        std::cerr << "❌ Could not load rows. Ensure 'steam.db' has a table called 'steam_games'.\n";
+        sqlite3_close(db);
+        return 1;
+    }
+
+    std::cout << "🧹 Formatting loaded games...\n";
+    format_all_games();
+
+    // ✅ Launch menu
+    std::cout << "📊 Launching interactive menu...\n";
+    run_menu();
+
+    // ✅ Clean up
+    sqlite3_close(db);
+    std::cout << "✅ Program exited successfully.\n";
+    return 0;
+}
